@@ -5,6 +5,7 @@ from typing import Optional
 from langchain.agents import Tool, initialize_agent
 from langchain.agents.agent_types import AgentType
 from langchain_groq import ChatGroq
+from langchain_core.messages import SystemMessage
 
 # Load .env file
 load_dotenv()
@@ -18,11 +19,21 @@ HEADERS = {
     "Notion-Version": "2022-06-28"
 }
 
+def get_DateTime(_=None):
+    import datetime
+    now = datetime.datetime.now()
+    return now.strftime("%Y-%m-%d %H:%M:%S")
 # ========================
 # NOTION FUNCTIONS
 # ========================
 
-def create_task(title: str, due_date: Optional[str] = None, status: str = "To Do"):
+def create_task(input_str: str):
+    """Create task from input string in format 'title|due_date|status'"""
+    parts = input_str.split('|')
+    title = parts[0].strip()
+    due_date = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+    status = parts[2].strip() if len(parts) > 2 and parts[2].strip() else "To Do"
+    
     url = "https://api.notion.com/v1/pages"
     payload = {
         "parent": {"database_id": NOTION_DATABASE_ID},
@@ -31,9 +42,10 @@ def create_task(title: str, due_date: Optional[str] = None, status: str = "To Do
             "Status": {"select": {"name": status}},
         }
     }
+    
     if due_date:
         payload["properties"]["Due Date"] = {"date": {"start": due_date}}
-
+    
     response = requests.post(url, headers=HEADERS, json=payload)
     return "✅ Task created!" if response.status_code == 200 else f"❌ Failed: {response.text}"
 
@@ -41,19 +53,21 @@ def get_tasks():
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
     response = requests.post(url, headers=HEADERS)
     if response.status_code != 200:
-        return f"❌ Failed: {response.text}"
+        return []
 
     tasks = response.json().get("results", [])
-    output = []
+    task_list = []
     for task in tasks:
         props = task["properties"]
         name = props["Name"]["title"][0]["text"]["content"] if props["Name"]["title"] else "Untitled"
-        status = props["Status"]["select"]["name"] if props["Status"]["select"] else "Unknown"
+        status = props["Status"]["select"]["name"] if props["Status"]["select"] else "No Status"
         due_date = props.get("Due Date", {}).get("date", {}).get("start", "No Date")
-        output.append(f"📌 {name} - {status} - Due: {due_date}")
-    return "\n".join(output)
+        task_list.append({"name": name, "status": status, "due_date": due_date})
+    
+    return task_list
 
-def update_task(task_name: str, new_status: str = "Done"):
+def update_task(task_name: str, new_status: str = None, due_date: str = None):
+    """Update task properties including status and due date"""
     url = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
     query = {
         "filter": {
@@ -70,13 +84,17 @@ def update_task(task_name: str, new_status: str = "Done"):
         return f"❌ No task found with name containing '{task_name}'"
 
     task_id = tasks[0]["id"]
-
     patch_url = f"https://api.notion.com/v1/pages/{task_id}"
-    payload = {
-        "properties": {
-            "Status": {"select": {"name": new_status}}
-        }
-    }
+    
+    # Build update payload based on provided parameters
+    payload = {"properties": {}}
+    
+    if new_status:
+        payload["properties"]["Status"] = {"select": {"name": new_status}}
+    
+    if due_date:
+        payload["properties"]["Due Date"] = {"date": {"start": due_date}}
+    
     update_response = requests.patch(patch_url, headers=HEADERS, json=payload)
     return "✅ Task updated!" if update_response.status_code == 200 else f"❌ Failed to update: {update_response.text}"
 
@@ -87,18 +105,23 @@ def update_task(task_name: str, new_status: str = "Done"):
 tools = [
     Tool(
         name="Create Task",
-        func=lambda text: create_task(text),
-        description="Use this to add a task to the Notion Student Planner. Input should be the task title. Optional: include due date."
+        func=create_task,
+        description="Create a new task in Notion. Input must be in format 'title|due_date|status' (due_date and status optional). Example: 'Finish project|2025-05-10|In Progress'"
     ),
     Tool(
         name="Get Tasks",
-        func=lambda _: get_tasks(),
+        func=lambda _: "\n".join([f"📌 {task['name']} - {task['status']} - {task['due_date']}" for task in get_tasks()]),
         description="Use this to retrieve a list of tasks from Notion."
     ),
     Tool(
         name="Update Task",
-        func=lambda text: update_task(text),
-        description="Use this to update a task status to Done. Input should be the task title."
+        func=update_task,
+        description="Update a task in Notion. Input format: 'task_title|new_status|due_date' (new_status and due_date are optional). Example: 'Finish project|Done|2025-05-10'"
+    ),
+    Tool(
+        name="Current Time",
+        func=get_DateTime,
+        description="Get current datetime in YYYY-MM-DD HH:MM:SS format. Input is ignored."
     )
 ]
 
@@ -108,15 +131,24 @@ tools = [
 
 llm = ChatGroq(
     temperature=0,
-    model_name="llama3-8b-8192",  # or try "mixtral-8x7b-32768"
+    model_name="llama3-8b-8192",
     groq_api_key=os.getenv("GROQ_API_KEY")
 )
 
 agent = initialize_agent(
     tools=tools,
     llm=llm,
-    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-    verbose=True
+    agent=AgentType.STRUCTURED_CHAT_ZERO_SHOT_REACT_DESCRIPTION,
+    verbose=True,
+    handle_parsing_errors=True,
+    max_iterations=3,
+    agent_kwargs={
+        "prefix": """You are a Notion task assistant. Follow these rules:
+1. For task creation: Use format 'title|due_date|status'
+2. Status defaults to 'To Do' if not specified
+3. Return FINAL ANSWER after operation
+"""
+    }
 )
 
 # ========================
